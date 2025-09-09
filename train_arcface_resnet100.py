@@ -1,368 +1,306 @@
 #!/usr/bin/env python3
 """
-ArcFace (ResNet100) TRAINING — auto-configured for your folder layout
-
-This script assumes the following **local** layout (no CLI args needed):
+Complete pipeline: ArcFace embeddings (InsightFace) + lightweight classifier + simple video attendance
+Auto‑configured for this folder layout (no CLI args required):
 
 project_root/
-├── train_arcface_resnet100.py   ← this file
-├── labels.csv                   ← in the same folder as the script
-└── dataset/                     ← folder that contains all student subfolders/images
-    ├── 63018_Anisha_Sarhadi/
-    ├── 61412_Areka_Raza_Hashmi/
-    └── ...
+├─ train_arcface_embed_clf.py    ← this file
+├─ labels.csv                    ← with columns: student_id,name,class,image_path
+└─ dataset/                      ← images per student in subfolders
+   ├─ 63018_Anisha_Sarhadi/
+   ├─ 61412_Areka_Raza_Hashmi/
+   └─ ...
 
-It will:
-  1) Read `labels.csv` and auto-resolve image paths whether they are like
-     `63018_xxx/img1.jpg` **or** `dataset/63018_xxx/img1.jpg`.
-  2) Detect + align faces to 112×112 using **RetinaFace** (insightface FaceAnalysis).
-  3) Fine‑tune **ArcFace** (iResNet‑100 backbone + ArcMargin head) on your students.
-  4) Save artifacts to `./arcface_artifacts/` by default:
-       - ckpt_best.pth
-       - prototypes.json (mean 512‑D embedding per student)
-       - embeddings.csv   (per‑image embeddings for quick audits)
+What this script does when run:
+1) Load `labels.csv`, resolve image paths inside ./dataset (supports paths with or without leading "dataset/").
+2) Use InsightFace FaceAnalysis ("buffalo_l") to detect, align, and embed faces (512‑D ArcFace embeddings).
+3) Build a training set of embeddings and train a small Logistic Regression classifier.
+4) Save artifacts into ./arcface_artifacts/:
+   - arcface_clf.joblib            (classifier)
+   - sid_maps.json                 (student id/name maps)
+   - prototypes.json               (mean embedding per student)
+   - embeddings.csv                (per‑image embedding rows for audit)
+5) (Optional demo) Run a very simple video attendance pass if you set VIDEO_PATH below.
 
 Dependencies (install on your GPU machine):
     pip install "torch==2.3.*" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    pip install insightface opencv-python pandas numpy scikit-learn tqdm albumentations timm
+    pip install insightface opencv-python pandas numpy scikit-learn tqdm joblib
 
 Notes:
-- First run will download model packs (RetinaFace + iResNet100) to ~/.insightface/models .
-- For small class rosters, start with **frozen backbone** (only ArcFace head trains). You can unfreeze later.
-- If your CPU-only environment is used, it will run but much slower; use a CUDA GPU if possible.
+- The first run downloads model packs to ~/.insightface/models .
+- For a production system, add multi‑object tracking (DeepSORT/ByteTrack) and temporal smoothing.
 """
 import os
-import math
 import json
-import time
-import random
+import math
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+# ML
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import StratifiedKFold
+import joblib
 
-# ---- InsightFace (detector + pretrained backbone) ----
+# InsightFace
 from insightface.app import FaceAnalysis
-from insightface.model_zoo import get_model
 
 # =====================
-# CONFIG (edit here)
+# CONFIG — edit as needed
 # =====================
-ROOT_DIR       = Path(__file__).parent.resolve()
-LABELS_CSV     = ROOT_DIR / "labels.csv"
-IMAGES_ROOT    = ROOT_DIR / "dataset"       # folder containing all student subfolders/images
-OUT_DIR        = ROOT_DIR / "arcface_artifacts"
-EPOCHS         = 10
-BATCH_SIZE     = 32
-LR             = 1e-3
-ARC_S          = 64.0      # ArcFace scale
-ARC_M          = 0.5       # ArcFace margin
-FREEZE_BACKBONE = True     # start with head-only fine‑tuning
-NUM_WORKERS    = 4         # reduce to 0 on Windows if you see DataLoader issues
-SEED           = 42
+ROOT_DIR = Path(__file__).parent.resolve()
+LABELS_CSV = ROOT_DIR / "labels.csv"
+IMAGES_ROOT = ROOT_DIR / "dataset"
+OUT_DIR = ROOT_DIR / "arcface_artifacts"
+
+# Video demo (optional): set a valid path here to run a quick attendance pass after training
+VIDEO_PATH = Path("803_30Sec.mp4")  # e.g., Path("/path/to/classroom.mp4")
+VIDEO_SAMPLE_EVERY = 15            # analyze every Nth frame
+SIM_THRESHOLD = 0.65               # cosine similarity vs prototype to accept identity
+MIN_HITS_FOR_PRESENT = 5           # min accepted frames to mark present
 
 # =====================
-# Utils
+# Utilities
 # =====================
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-# =====================
-# ArcMargin (ArcFace head)
-# =====================
-class ArcMarginProduct(nn.Module):
-    def __init__(self, in_features: int, out_features: int, s: float = 64.0, m: float = 0.5, easy_margin: bool = False):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.s = s
-        self.m = m
-        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
-        nn.init.xavier_uniform_(self.weight)
-        self.easy_margin = easy_margin
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)
-        self.mm = math.sin(math.pi - m) * m
 
-    def forward(self, input: torch.Tensor, label: torch.Tensor):
-        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
-        sine = torch.sqrt(torch.clamp(1.0 - cosine ** 2, min=1e-9))
-        phi = cosine * self.cos_m - sine * self.sin_m
-        if self.easy_margin:
-            phi = torch.where(cosine > 0, phi, cosine)
-        else:
-            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
-        one_hot = torch.zeros_like(cosine)
-        one_hot.scatter_(1, label.view(-1, 1), 1.0)
-        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        output *= self.s
-        return output
+def resolve_image_paths(df: pd.DataFrame, images_root: Path) -> List[Tuple[Path, int, int, str]]:
+    """Return list of (abs_path, cls_idx, sid, name). Supports paths with or without 'dataset/' prefix."""
+    sids = sorted(df["student_id"].astype(int).unique().tolist())
+    sid2idx = {int(s): i for i, s in enumerate(sids)}
 
-# =====================
-# Dataset
-# =====================
-class FacesFromCSV(Dataset):
-    def __init__(self, labels_csv: Path, images_root: Path, face_app: FaceAnalysis, out_size: int = 112, augment: bool = True):
-        self.df = pd.read_csv(labels_csv)
-        self.images_root = Path(images_root)
-        self.face_app = face_app
-        self.out_size = out_size
-        self.augment = augment
+    items = []
+    missing = 0
+    for _, row in df.iterrows():
+        sid = int(row['student_id'])
+        name = str(row['name'])
+        cls_idx = sid2idx[sid]
+        rel = str(row['image_path']).lstrip("./")
+        # Style A: already starts with dataset/
+        p = (images_root.parent / rel) if rel.startswith("dataset/") else (images_root / rel)
+        if not p.exists():
+            missing += 1
+            continue
+        items.append((p, cls_idx, sid, name))
+    if missing:
+        print(f"[WARN] {missing} image paths from CSV were not found on disk and will be skipped.")
+    if not items:
+        raise SystemExit("No images found. Check labels.csv and dataset/ structure.")
+    return items
 
-        # Map student_id → class index 0..C-1
-        sids = sorted(self.df["student_id"].unique().tolist())
-        self.sid2idx = {int(s): i for i, s in enumerate(sids)}
 
-        # Build a resolved file list up-front (robust to either path style)
-        self.items = []  # list of (abs_path, class_idx, student_id)
-        missing = 0
-        for _, row in self.df.iterrows():
-            sid = int(row['student_id'])
-            cls_idx = self.sid2idx[sid]
-            rel = str(row['image_path']).lstrip("./")
-            # support two styles: "dataset/..." or just "folder/file.jpg"
-            p1 = (self.images_root.parent / rel) if rel.startswith("dataset/") else (self.images_root / rel)
-            if not p1.exists():
-                # try inside student folder if only folder name was given
-                p_try = self.images_root / rel
-                if p_try.exists():
-                    p1 = p_try
-            if p1.exists():
-                self.items.append((p1, cls_idx, sid))
-            else:
-                missing += 1
-        if missing:
-            print(f"[WARN] {missing} images referenced in CSV could not be found. They will be skipped.")
-        if not self.items:
-            raise RuntimeError("No images found. Check your labels.csv and dataset/ structure.")
+def init_face_app() -> FaceAnalysis:
+    app = FaceAnalysis(name='buffalo_l')
+    # ctx_id: 0 for GPU (if available), -1 for CPU
+    try:
+        import torch
+        has_cuda = torch.cuda.is_available()
+    except Exception:
+        has_cuda = False
+    app.prepare(ctx_id=0 if has_cuda else -1, det_size=(640, 640))
+    return app
 
-        # Light augmentations
-        aug = []
-        if augment:
-            aug += [
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.15, contrast=0.15)
-            ]
-        self.aug_tf = transforms.Compose(aug) if aug else None
-        self.to_tensor = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # → [-1,1]
-        ])
 
-    def __len__(self):
-        return len(self.items)
+def extract_embedding(app: FaceAnalysis, bgr_img: np.ndarray) -> Optional[np.ndarray]:
+    faces = app.get(bgr_img)
+    if not faces:
+        return None
+    # choose largest face
+    faces.sort(key=lambda d: (d['bbox'][2]-d['bbox'][0])*(d['bbox'][3]-d['bbox'][1]), reverse=True)
+    f = faces[0]
+    emb = f.get('normed_embedding', None)
+    if emb is None:
+        emb = f.get('embedding', None)
+    if emb is None:
+        return None
+    v = np.asarray(emb, dtype=np.float32)
+    # ensure normalized (some builds already return L2-normalized)
+    n = np.linalg.norm(v) + 1e-9
+    return v / n
 
-    def _align_face(self, img_bgr: np.ndarray) -> np.ndarray:
-        preds = self.face_app.get(img_bgr)
-        if len(preds) == 0:
-            # fallback: center-crop
-            h, w = img_bgr.shape[:2]
-            m = min(h, w)
-            y0 = (h - m) // 2
-            x0 = (w - m) // 2
-            crop = img_bgr[y0:y0 + m, x0:x0 + m]
-            return cv2.resize(crop, (self.out_size, self.out_size), interpolation=cv2.INTER_AREA)
-        preds.sort(key=lambda d: (d['bbox'][2]-d['bbox'][0])*(d['bbox'][3]-d['bbox'][1]), reverse=True)
-        kps = preds[0]['kps']
-        src = np.array(kps, dtype=np.float32)
-        dst = np.array([
-            [38.2946, 51.6963],
-            [73.5318, 51.5014],
-            [56.0252, 71.7366],
-            [41.5493, 92.3655],
-            [70.7299, 92.2041],
-        ], dtype=np.float32)
-        M = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)[0]
-        aligned = cv2.warpAffine(img_bgr, M, (self.out_size, self.out_size))
-        return aligned
 
-    def __getitem__(self, idx: int):
-        path, cls_idx, sid = self.items[idx]
-        img_bgr = cv2.imread(str(path))
-        if img_bgr is None:
-            raise FileNotFoundError(f"Cannot read {path}")
-        aligned = self._align_face(img_bgr)
-        img = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
-        if self.aug_tf:
-            img = self.aug_tf(transforms.ToPILImage()(img))
-            img = np.array(img)
-        x = self.to_tensor(img)
-        y = cls_idx
-        return x, y, sid
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
 
 # =====================
-# Model wrapper
+# Training
 # =====================
-class ArcFaceModel(nn.Module):
-    def __init__(self, num_classes: int, feat_dim: int = 512, s: float = ARC_S, m: float = ARC_M):
-        super().__init__()
-        # Pretrained iResNet100
-        self.backbone = get_model('glint360k_r100_fc')  # downloads on first use
-        self.backbone.eval()
-        self.head = ArcMarginProduct(in_features=feat_dim, out_features=num_classes, s=s, m=m)
 
-    def forward(self, x: torch.Tensor, labels: torch.Tensor | None = None):
-        feat = self.backbone.forward(x)  # [B,512]
-        feat = F.normalize(feat)
-        if labels is None:
-            return feat
-        logits = self.head(feat, labels)
-        return logits, feat
-
-# =====================
-# Train / Eval helpers
-# =====================
-@torch.no_grad()
-def compute_prototypes(backbone: nn.Module, loader: DataLoader, device: torch.device) -> dict:
-    backbone.eval()
-    sums, counts = {}, {}
-    for x, y, sid in tqdm(loader, desc="Prototypes", leave=False):
-        x = x.to(device)
-        f = F.normalize(backbone.forward(x))
-        f = f.detach().cpu().numpy()
-        for i in range(f.shape[0]):
-            key = int(sid[i])
-            sums[key] = sums.get(key, 0) + f[i]
-            counts[key] = counts.get(key, 0) + 1
-    return {k: (sums[k]/counts[k]).tolist() for k in sums}
+def build_embeddings(items: List[Tuple[Path,int,int,str]], app: FaceAnalysis) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
+    X, y, meta = [], [], []
+    for p, cls_idx, sid, name in tqdm(items, desc="Embeddings"):
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+        e = extract_embedding(app, img)
+        if e is None:
+            continue
+        X.append(e)
+        y.append(cls_idx)
+        meta.append({"sid": sid, "name": name, "path": str(p)})
+    if not X:
+        raise SystemExit("No embeddings extracted (all images failed detection).")
+    return np.vstack(X).astype(np.float32), np.asarray(y, dtype=np.int64), meta
 
 
-def main():
-    set_seed(SEED)
+def train_classifier(X: np.ndarray, y: np.ndarray) -> LogisticRegression:
+    clf = LogisticRegression(max_iter=4000, n_jobs=-1, multi_class='ovr')
+    clf.fit(X, y)
+    return clf
+
+
+def evaluate_kfold(X: np.ndarray, y: np.ndarray, k: int = 5) -> None:
+    # quick sanity check accuracy across folds
+    skf = StratifiedKFold(n_splits=min(k, np.unique(y, return_counts=True)[1].min()), shuffle=True, random_state=42)
+    accs = []
+    for tr, va in skf.split(X, y):
+        clf = LogisticRegression(max_iter=4000, n_jobs=-1, multi_class='ovr')
+        clf.fit(X[tr], y[tr])
+        pr = clf.predict(X[va])
+        accs.append(accuracy_score(y[va], pr))
+    print(f"KFold accuracy (mean±std): {np.mean(accs):.4f} ± {np.std(accs):.4f} over {len(accs)} folds")
+
+
+def compute_prototypes(X: np.ndarray, y: np.ndarray, idx2sid: Dict[int,int]) -> Dict[int, List[float]]:
+    protos: Dict[int, List[float]] = {}
+    for cls_idx in np.unique(y):
+        sid = int(idx2sid[int(cls_idx)])
+        protos[sid] = X[y == cls_idx].mean(axis=0).tolist()
+    return protos
+
+
+def save_artifacts(clf: LogisticRegression,
+                   protos: Dict[int, List[float]],
+                   sid2idx: Dict[int,int],
+                   idx2sid: Dict[int,int],
+                   sid2name: Dict[int,str],
+                   meta_rows: List[Dict]):
     ensure_dir(OUT_DIR)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Face detector/alignment
-    face_app = FaceAnalysis(name='buffalo_l')
-    face_app.prepare(ctx_id=0 if torch.cuda.is_available() else -1, det_size=(640,640))
-
-    # Dataset & split (80/20 per student by row order)
-    ds = FacesFromCSV(LABELS_CSV, IMAGES_ROOT, face_app, out_size=112, augment=True)
-    num_classes = len(ds.sid2idx)
-
-    train_idx, val_idx = [], []
-    for sid, group in ds.df.groupby('student_id'):
-        idxs = [i for i, it in enumerate(ds.items) if it[2] == int(sid)]  # indices in items
-        cut = max(1, int(0.8 * len(idxs)))
-        train_idx += idxs[:cut]
-        val_idx   += idxs[cut:]
-
-    subset_train = torch.utils.data.Subset(ds, train_idx)
-    subset_val   = torch.utils.data.Subset(ds, val_idx)
-
-    loader_train = DataLoader(subset_train, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True)
-    loader_val   = DataLoader(subset_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-
-    # Model
-    model = ArcFaceModel(num_classes=num_classes)
-    model.to(device)
-
-    if FREEZE_BACKBONE:
-        for p in model.backbone.parameters():
-            p.requires_grad = False
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
-    best_val_acc = 0.0
-
-    for epoch in range(1, EPOCHS + 1):
-        # ---- Train ----
-        model.train()
-        total, correct, loss_sum = 0, 0, 0.0
-        for x, y, _ in tqdm(loader_train, desc=f"Epoch {epoch}/{EPOCHS}"):
-            x = x.to(device)
-            y = y.to(device)
-            optimizer.zero_grad()
-            logits, _ = model(x, y)
-            loss = F.cross_entropy(logits, y)
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                pred = logits.argmax(dim=1)
-                correct += (pred == y).sum().item()
-                total += x.size(0)
-                loss_sum += loss.item() * x.size(0)
-        train_acc = correct / max(1, total)
-        train_loss = loss_sum / max(1, total)
-
-        # ---- Validate ----
-        model.eval()
-        v_total, v_correct = 0, 0
-        with torch.no_grad():
-            for x, y, _ in loader_val:
-                x = x.to(device); y = y.to(device)
-                logits, _ = model(x, y)
-                pred = logits.argmax(dim=1)
-                v_correct += (pred == y).sum().item()
-                v_total += x.size(0)
-        val_acc = v_correct / max(1, v_total) if v_total else 0.0
-        scheduler.step()
-
-        print(f"Epoch {epoch}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} val_acc={val_acc:.4f}")
-
-        # Save best checkpoint
-        if val_acc >= best_val_acc:
-            best_val_acc = val_acc
-            ckpt = {
-                'epoch': epoch,
-                'state_dict': model.state_dict(),
-                'sid2idx': ds.sid2idx,
-                'config': {
-                    'EPOCHS': EPOCHS, 'BATCH_SIZE': BATCH_SIZE, 'LR': LR,
-                    'ARC_S': ARC_S, 'ARC_M': ARC_M, 'FREEZE_BACKBONE': FREEZE_BACKBONE
-                }
-            }
-            torch.save(ckpt, OUT_DIR / 'ckpt_best.pth')
-            print(f"[SAVE] Best checkpoint → {OUT_DIR / 'ckpt_best.pth'} (val_acc={val_acc:.4f})")
-
-    # ---- Export prototypes & embeddings on the full dataset ----
-    print("Computing prototypes & embeddings …")
-    full_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-
-    # Load best
-    best = torch.load(OUT_DIR / 'ckpt_best.pth', map_location=device)
-    model.load_state_dict(best['state_dict'])
-    model.eval()
-
-    # Prototypes
-    protos = compute_prototypes(model.backbone, full_loader, device)
-    with open(OUT_DIR / 'prototypes.json', 'w') as f:
+    joblib.dump(clf, OUT_DIR / "arcface_clf.joblib")
+    with open(OUT_DIR / "prototypes.json", 'w') as f:
         json.dump(protos, f, indent=2)
+    with open(OUT_DIR / "sid_maps.json", 'w') as f:
+        json.dump({"sid2idx": sid2idx, "idx2sid": idx2sid, "sid2name": sid2name}, f, indent=2)
+    # embeddings CSV for audit
+    import csv
+    csv_path = OUT_DIR / "embeddings.csv"
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        # only save metadata (embeddings are large; omit for brevity)
+        w.writerow(["sid", "name", "path"]) 
+        for m in meta_rows:
+            w.writerow([m['sid'], m['name'], m['path']])
+    print(f"Artifacts saved in {OUT_DIR}")
 
-    # Embeddings CSV (auditing)
+
+# =====================
+# Simple video attendance demo (frame sampling + prototype matching)
+# =====================
+
+def run_video_attendance(app: FaceAnalysis, protos: Dict[int, List[float]], sid2name: Dict[int,str], video_path: Path):
+    print(f"\n[Video demo] {video_path}")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print("Cannot open video; skipping.")
+        return
+    hits: Dict[int, int] = {}
+    frame_idx = 0
+    proto_mat = {sid: np.asarray(vec, dtype=np.float32) for sid, vec in protos.items()}
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % VIDEO_SAMPLE_EVERY != 0:
+            frame_idx += 1
+            continue
+        faces = app.get(frame)
+        for f in faces:
+            emb = f.get('normed_embedding', None) or f.get('embedding', None)
+            if emb is None:
+                continue
+            e = np.asarray(emb, dtype=np.float32)
+            e = e / (np.linalg.norm(e) + 1e-9)
+            # nearest prototype by cosine
+            best_sid, best_sim = None, -1.0
+            for sid, pv in proto_mat.items():
+                s = cosine(e, pv)
+                if s > best_sim:
+                    best_sid, best_sim = sid, s
+            if best_sid is not None and best_sim >= SIM_THRESHOLD:
+                hits[best_sid] = hits.get(best_sid, 0) + 1
+        frame_idx += 1
+    cap.release()
+
+    # Decide attendance
     rows = []
-    with torch.no_grad():
-        for x, y, sid in tqdm(full_loader, desc="Embeddings"):
-            x = x.to(device)
-            f = F.normalize(model.backbone.forward(x)).cpu().numpy()
-            for i in range(f.shape[0]):
-                rows.append({
-                    'student_id': int(sid[i]),
-                    'cls_idx': int(y[i].item()),
-                    **{f'f{j}': float(f[i, j]) for j in range(f.shape[1])}
-                })
-    pd.DataFrame(rows).to_csv(OUT_DIR / 'embeddings.csv', index=False)
-    print(f"[DONE] Artifacts written to: {OUT_DIR}")
+    for sid, name in sid2name.items():
+        present = 1 if hits.get(sid, 0) >= MIN_HITS_FOR_PRESENT else 0
+        rows.append((sid, name, present, hits.get(sid, 0)))
+    # Save CSV
+    out_csv = OUT_DIR / "attendance_demo.csv"
+    import csv
+    with open(out_csv, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(["student_id", "name", "present", "hit_count"]) 
+        for r in rows:
+            w.writerow(r)
+    print(f"Wrote {out_csv}")
 
 
+# =====================
+# Main
+# =====================
 if __name__ == "__main__":
-    main()
+    # 0) Load labels and resolve paths
+    if not LABELS_CSV.exists():
+        raise SystemExit(f"labels.csv not found at {LABELS_CSV}")
+    if not IMAGES_ROOT.exists():
+        raise SystemExit(f"dataset folder not found at {IMAGES_ROOT}")
+
+    df = pd.read_csv(LABELS_CSV)
+    items = resolve_image_paths(df, IMAGES_ROOT)
+
+    # Build maps
+    sids = sorted(df["student_id"].astype(int).unique().tolist())
+    sid2idx = {int(s): i for i, s in enumerate(sids)}
+    idx2sid = {i: s for s, i in sid2idx.items()}
+    sid2name = {int(r['student_id']): str(r['name']) for _, r in df.drop_duplicates('student_id').iterrows()}
+
+    # 1) Init face app (detector + recognition)
+    app = init_face_app()
+
+    # 2) Extract embeddings
+    X, y, meta = build_embeddings(items, app)
+    print(f"Embeddings built: X={X.shape}, classes={len(np.unique(y))}")
+
+    # 3) Quick k-fold sanity check
+    try:
+        evaluate_kfold(X, y, k=5)
+    except Exception as e:
+        print(f"(KFold skip) {e}")
+
+    # 4) Train classifier
+    clf = train_classifier(X, y)
+    print("Classifier trained.")
+
+    # 5) Prototypes per student (sid)
+    protos = compute_prototypes(X, y, idx2sid)
+
+    # 6) Save artifacts
+    ensure_dir(OUT_DIR)
+    save_artifacts(clf, protos, sid2idx, idx2sid, sid2name, meta)
+
+    # 7) Optional: run a simple video demo if VIDEO_PATH is set
+    if VIDEO_PATH is not None and Path(VIDEO_PATH).exists():
+        run_video_attendance(app, protos, sid2name, Path(VIDEO_PATH))
+    else:
+        print("Video demo skipped (set VIDEO_PATH in the script to run it).")
