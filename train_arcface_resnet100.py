@@ -59,7 +59,7 @@ IMAGES_ROOT = ROOT_DIR / "dataset"
 OUT_DIR = ROOT_DIR / "arcface_artifacts"
 
 # Video demo (optional): set a valid path here to run a quick attendance pass after training
-VIDEO_PATH = Path("803_30Sec.mp4")  # e.g., Path("/path/to/classroom.mp4")
+VIDEO_PATH = Path("input.mp4")  # e.g., Path("/path/to/classroom.mp4")
 VIDEO_SAMPLE_EVERY = 15            # analyze every Nth frame
 SIM_THRESHOLD = 0.65               # cosine similarity vs prototype to accept identity
 MIN_HITS_FOR_PRESENT = 5           # min accepted frames to mark present
