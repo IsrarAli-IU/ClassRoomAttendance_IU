@@ -153,7 +153,8 @@ def build_embeddings(items: List[Tuple[Path,int,int,str]], app: FaceAnalysis) ->
 
 
 def train_classifier(X: np.ndarray, y: np.ndarray) -> LogisticRegression:
-    clf = LogisticRegression(max_iter=4000, n_jobs=-1, multi_class='ovr')
+    # Avoid joblib child processes (prevents segfaults from torch import in workers)
+    clf = LogisticRegression(max_iter=4000, n_jobs=1, multi_class='ovr', solver='lbfgs')
     clf.fit(X, y)
     return clf
 
@@ -163,7 +164,7 @@ def evaluate_kfold(X: np.ndarray, y: np.ndarray, k: int = 5) -> None:
     skf = StratifiedKFold(n_splits=min(k, np.unique(y, return_counts=True)[1].min()), shuffle=True, random_state=42)
     accs = []
     for tr, va in skf.split(X, y):
-        clf = LogisticRegression(max_iter=4000, n_jobs=-1, multi_class='ovr')
+        clf = LogisticRegression(max_iter=4000, n_jobs=1, multi_class='ovr', solver='lbfgs')
         clf.fit(X[tr], y[tr])
         pr = clf.predict(X[va])
         accs.append(accuracy_score(y[va], pr))
